@@ -37,10 +37,8 @@ type ActualizarEmpleado struct {
 
 func main() {
 	// Cargar las variables del archivo .env
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatalf("Error al cargar el archivo .env: %v", err)
-	}
+	// Intentar cargar el archivo .env (solo servirá en local, en Render se lo saltará pacíficamente)
+	_ = godotenv.Load()
 
 	// 1. Leer las credenciales
 	usuario := os.Getenv("DB_USER")
@@ -69,7 +67,7 @@ func main() {
 	fmt.Println("¡Conexión exitosa a la base de datos de Aiven! 🚀")
 
 	// ==========================================
-	// --- AQUÍ EMPIEZA TU API REST CON GIN ---
+	// --- AQUÍ EMPIEZA API REST CON GIN ---
 	// ==========================================
 
 	// Crear el servidor de Gin por defecto
