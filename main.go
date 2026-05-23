@@ -43,6 +43,14 @@ type LoginRequest struct {
 	Contrasena string `json:"contrasena"`
 }
 
+// RegistroUsuario sirve para recibir los datos de un nuevo acceso creado por el Admin
+type RegistroUsuario struct {
+	Correo     string `json:"correo"`
+	Contrasena string `json:"contrasena"`
+	Rol        string `json:"rol"`
+	EmpleadoID *int   `json:"empleado_id"` // Usamos un puntero (*int) para que acepte nulos en la DB si es Admin
+}
+
 // --- MIDDLEWARE DE SEGURIDAD (INTERCEPTOR EN EL BACKEND) ---
 
 func AuthMiddleware(db *sql.DB) gin.HandlerFunc {
@@ -109,7 +117,7 @@ func main() {
 	// Ruta de prueba pública: http://localhost:8080/ping
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"mensaje": "¡La API está viva y funcionando! 🤖",
+			"mensaje": "¡La API está viva y funcionando! ",
 		})
 	})
 
@@ -161,14 +169,14 @@ func main() {
 		// --- RUTA 1: CONSULTA DE PERSONAL (READ) ---
 		api.GET("/empleados", func(c *gin.Context) {
 			query := `
-				SELECT e.emp_no, e.first_name, e.last_name, t.title, s.salary 
-				FROM employees e
-				INNER JOIN titles t ON e.emp_no = t.emp_no
-				INNER JOIN salaries s ON e.emp_no = s.emp_no
-				WHERE t.to_date = '9999-01-01' AND s.to_date = '9999-01-01'
-				ORDER BY e.emp_no DESC
-				LIMIT 20;
-			`
+                SELECT e.emp_no, e.first_name, e.last_name, t.title, s.salary 
+                FROM employees e
+                INNER JOIN titles t ON e.emp_no = t.emp_no
+                INNER JOIN salaries s ON e.emp_no = s.emp_no
+                WHERE t.to_date = '9999-01-01' AND s.to_date = '9999-01-01'
+                ORDER BY e.emp_no DESC
+                LIMIT 20;
+            `
 
 			rows, err := db.Query(query)
 			if err != nil {
@@ -210,8 +218,8 @@ func main() {
 			nuevoID := ultimoID + 1
 
 			_, err = db.Exec(`
-				INSERT INTO employees (emp_no, birth_date, first_name, last_name, gender, hire_date) 
-				VALUES (?, '1995-01-01', ?, ?, 'M', CURDATE())`,
+                INSERT INTO employees (emp_no, birth_date, first_name, last_name, gender, hire_date) 
+                VALUES (?, '1995-01-01', ?, ?, 'M', CURDATE())`,
 				nuevoID, datos.FirstName, datos.LastName,
 			)
 			if err != nil {
@@ -220,18 +228,18 @@ func main() {
 			}
 
 			_, err = db.Exec(`
-				INSERT INTO titles (emp_no, title, from_date, to_date) 
-				VALUES (?, ?, CURDATE(), '9999-01-01')`,
+                INSERT INTO titles (emp_no, title, from_date, to_date) 
+                VALUES (?, ?, CURDATE(), '9999-01-01')`,
 				nuevoID, datos.Puesto,
 			)
 			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al asignar puesto: " + err.Error()})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al asignarse puesto: " + err.Error()})
 				return
 			}
 
 			_, err = db.Exec(`
-				INSERT INTO salaries (emp_no, salary, from_date, to_date) 
-				VALUES (?, ?, CURDATE(), '9999-01-01')`,
+                INSERT INTO salaries (emp_no, salary, from_date, to_date) 
+                VALUES (?, ?, CURDATE(), '9999-01-01')`,
 				nuevoID, datos.Salario,
 			)
 			if err != nil {
@@ -256,9 +264,9 @@ func main() {
 			}
 
 			_, err := db.Exec(`
-				UPDATE titles 
-				SET title = ? 
-				WHERE emp_no = ? AND to_date = '9999-01-01'`,
+                UPDATE titles 
+                SET title = ? 
+                WHERE emp_no = ? AND to_date = '9999-01-01'`,
 				datos.Puesto, idEmpleado,
 			)
 			if err != nil {
@@ -267,9 +275,9 @@ func main() {
 			}
 
 			_, err = db.Exec(`
-				UPDATE salaries 
-				SET salary = ? 
-				WHERE emp_no = ? AND to_date = '9999-01-01'`,
+                UPDATE salaries 
+                SET salary = ? 
+                WHERE emp_no = ? AND to_date = '9999-01-01'`,
 				datos.Salario, idEmpleado,
 			)
 			if err != nil {
@@ -308,6 +316,45 @@ func main() {
 				"mensaje": fmt.Sprintf("¡Empleado %s dado de baja correctamente de Coffeet! ☕", idEmpleado),
 			})
 		})
+
+		// --- RUTA 5: REGISTRAR NUEVO ACCESO/USUARIO (CREATE - SOLO ADMIN) ---
+		api.POST("/register", func(c *gin.Context) {
+			// 1. Validar desde la base de datos que quien hace la petición sea un Administrador
+			tokenHeader := c.GetHeader("Authorization") // Contiene el correo del administrador conectado
+			var rolSolicitante string
+			err := db.QueryRow("SELECT rol FROM usuarios WHERE correo = ?", tokenHeader).Scan(&rolSolicitante)
+			if err != nil || rolSolicitante != "admin" {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Permisos insuficientes. Solo los administradores pueden registrar usuarios."})
+				return
+			}
+
+			// 2. Mapear los datos JSON que vienen desde la app Android
+			var req RegistroUsuario
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Datos inválidos: " + err.Error()})
+				return
+			}
+
+			// 3. Validar si el correo ya existe para evitar duplicados
+			var existe bool
+			_ = db.QueryRow("SELECT EXISTS(SELECT 1 FROM usuarios WHERE correo = ?)", req.Correo).Scan(&existe)
+			if existe {
+				c.JSON(http.StatusConflict, gin.H{"error": "El correo ya se encuentra registrado."})
+				return
+			}
+
+			// 4. Insertar el nuevo usuario en la tabla de usuarios
+			query := "INSERT INTO usuarios (correo, contrasena, rol, empleado_id) VALUES (?, ?, ?, ?)"
+			_, err = db.Exec(query, req.Correo, req.Contrasena, req.Rol, req.EmpleadoID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al guardar el usuario: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"mensaje": "¡Usuario credencializado con éxito en Coffeet! ☕",
+			})
+		})
 	}
 
 	// --- CONFIGURACIÓN DINÁMICA DEL PUERTO PARA EL SERVIDOR (RENDER) ---
@@ -317,7 +364,7 @@ func main() {
 	}
 
 	// Encender el servidor
-	fmt.Printf("Servidor corriendo en el puerto %s ✨\n", puertoEnv)
+	fmt.Printf("Servidor corriendo en el puerto %s \n", puertoEnv)
 	err = r.Run(":" + puertoEnv)
 	if err != nil {
 		log.Fatalf("No se pudo encender el servidor: %v", err)
