@@ -156,7 +156,7 @@ func main() {
 	// --- RUTAS PROTEGIDAS POR EL MIDDLEWARE (Requieren cabecera Authorization) ---
 	// =========================================================================
 	api := r.Group("/")
-	api.Use(AuthMiddleware(db))
+	//api.Use(AuthMiddleware(db))
 	{
 		// --- RUTA 1: CONSULTA DE PERSONAL (READ) ---
 		api.GET("/empleados", func(c *gin.Context) {
