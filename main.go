@@ -12,6 +12,8 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// --- ESTRUCTURAS DE DATOS (MODELOS) ---
+
 // Empleado representa la estructura de datos que enviaremos como JSON
 type Empleado struct {
 	EmpNo     int    `json:"id"`
@@ -21,7 +23,7 @@ type Empleado struct {
 	Salario   int    `json:"salario"`
 }
 
-// NuevoEmpleado sirve para recibir los datos desde el cliente de escritorio
+// NuevoEmpleado sirve para recibir los datos desde el cliente
 type NuevoEmpleado struct {
 	FirstName string `json:"nombre"`
 	LastName  string `json:"apellido"`
@@ -35,9 +37,40 @@ type ActualizarEmpleado struct {
 	Salario int    `json:"salario"`
 }
 
+// LoginRequest sirve para recibir las credenciales universales de inicio de sesión
+type LoginRequest struct {
+	Correo     string `json:"correo"`
+	Contrasena string `json:"contrasena"`
+}
+
+// --- MIDDLEWARE DE SEGURIDAD (INTERCEPTOR EN EL BACKEND) ---
+
+func AuthMiddleware(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// El cliente (Android/Web) enviará el correo en la cabecera "Authorization"
+		tokenHeader := c.GetHeader("Authorization")
+
+		if tokenHeader == "" {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Acceso denegado. Token faltante."})
+			c.Abort() // Detiene la petición inmediatamente
+			return
+		}
+
+		// Validar si el usuario que intenta acceder realmente existe en la base de datos de Aiven
+		var existe bool
+		err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM usuarios WHERE correo = ?)", tokenHeader).Scan(&existe)
+		if err != nil || !existe {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Token inválido o usuario no autorizado."})
+			c.Abort()
+			return
+		}
+
+		c.Next() // Permite continuar a la ruta si todo está bien
+	}
+}
+
 func main() {
-	// Cargar las variables del archivo .env
-	// Intentar cargar el archivo .env (solo servirá en local, en Render se lo saltará pacíficamente)
+	// Cargar las variables del archivo .env (solo servirá en local, en Render se lo saltará pacíficamente)
 	_ = godotenv.Load()
 
 	// 1. Leer las credenciales
@@ -73,166 +106,211 @@ func main() {
 	// Crear el servidor de Gin por defecto
 	r := gin.Default()
 
-	// Ruta de prueba: http://localhost:8080/ping
+	// Ruta de prueba pública: http://localhost:8080/ping
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"mensaje": "¡La API está viva y funcionando! 🤖",
 		})
 	})
 
-	// --- RUTA 1: CONSULTA DE PERSONAL (READ) ---
-	r.GET("/empleados", func(c *gin.Context) {
-		query := `
-			SELECT e.emp_no, e.first_name, e.last_name, t.title, s.salary 
-			FROM employees e
-			INNER JOIN titles t ON e.emp_no = t.emp_no
-			INNER JOIN salaries s ON e.emp_no = s.emp_no
-			WHERE t.to_date = '9999-01-01' AND s.to_date = '9999-01-01'
-			ORDER BY e.emp_no DESC
-			LIMIT 20;
-		`
-
-		rows, err := db.Query(query)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al consultar la base de datos: " + err.Error()})
+	// --- ENDPOINT UNIVERSAL DE LOGIN (PÚBLICO) ---
+	r.POST("/login", func(c *gin.Context) {
+		var req LoginRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Datos inválidos"})
 			return
 		}
-		defer rows.Close()
 
-		var listaEmpleados []Empleado
+		var dbContrasena string
+		var dbRol string
+		var dbEmpleadoID sql.NullInt32 // NullInt32 maneja correctamente el valor NULL del Administrador
 
-		for rows.Next() {
-			var emp Empleado
-			err := rows.Scan(&emp.EmpNo, &emp.FirstName, &emp.LastName, &emp.Puesto, &emp.Salario)
+		// Buscar las credenciales en la tabla que creamos juntos
+		err := db.QueryRow("SELECT contrasena, rol, empleado_id FROM usuarios WHERE correo = ?", req.Correo).
+			Scan(&dbContrasena, &dbRol, &dbEmpleadoID)
+
+		if err == sql.ErrNoRows || dbContrasena != req.Contrasena {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Correo o contraseña incorrectos"})
+			return
+		} else if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error en el servidor: " + err.Error()})
+			return
+		}
+
+		// Si el empleado_id es NULL, lo transformamos a 0 para el JSON
+		var empID int = 0
+		if dbEmpleadoID.Valid {
+			empID = int(dbEmpleadoID.Int32)
+		}
+
+		// Devolvemos la respuesta con el rol y el id vinculado
+		c.JSON(http.StatusOK, gin.H{
+			"mensaje":     "¡Bienvenido!",
+			"token":       req.Correo,
+			"rol":         dbRol,
+			"empleado_id": empID,
+		})
+	})
+
+	// =========================================================================
+	// --- RUTAS PROTEGIDAS POR EL MIDDLEWARE (Requieren cabecera Authorization) ---
+	// =========================================================================
+	api := r.Group("/")
+	api.Use(AuthMiddleware(db))
+	{
+		// --- RUTA 1: CONSULTA DE PERSONAL (READ) ---
+		api.GET("/empleados", func(c *gin.Context) {
+			query := `
+				SELECT e.emp_no, e.first_name, e.last_name, t.title, s.salary 
+				FROM employees e
+				INNER JOIN titles t ON e.emp_no = t.emp_no
+				INNER JOIN salaries s ON e.emp_no = s.emp_no
+				WHERE t.to_date = '9999-01-01' AND s.to_date = '9999-01-01'
+				ORDER BY e.emp_no DESC
+				LIMIT 20;
+			`
+
+			rows, err := db.Query(query)
 			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al leer los datos: " + err.Error()})
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al consultar la base de datos: " + err.Error()})
 				return
 			}
-			listaEmpleados = append(listaEmpleados, emp)
-		}
+			defer rows.Close()
 
-		c.JSON(http.StatusOK, listaEmpleados)
-	})
+			var listaEmpleados []Empleado
 
-	// --- RUTA 2: REGISTRAR EMPLEADO (CREATE) ---
-	r.POST("/empleados", func(c *gin.Context) {
-		var datos NuevoEmpleado
+			for rows.Next() {
+				var emp Empleado
+				err := rows.Scan(&emp.EmpNo, &emp.FirstName, &emp.LastName, &emp.Puesto, &emp.Salario)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al leer los datos: " + err.Error()})
+					return
+				}
+				listaEmpleados = append(listaEmpleados, emp)
+			}
 
-		if err := c.ShouldBindJSON(&datos); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Datos inválidos: " + err.Error()})
-			return
-		}
-
-		var ultimoID int
-		err := db.QueryRow("SELECT MAX(emp_no) FROM employees").Scan(&ultimoID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al calcular el nuevo ID: " + err.Error()})
-			return
-		}
-		nuevoID := ultimoID + 1
-
-		_, err = db.Exec(`
-			INSERT INTO employees (emp_no, birth_date, first_name, last_name, gender, hire_date) 
-			VALUES (?, '1995-01-01', ?, ?, 'M', CURDATE())`,
-			nuevoID, datos.FirstName, datos.LastName,
-		)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al crear empleado: " + err.Error()})
-			return
-		}
-
-		_, err = db.Exec(`
-			INSERT INTO titles (emp_no, title, from_date, to_date) 
-			VALUES (?, ?, CURDATE(), '9999-01-01')`,
-			nuevoID, datos.Puesto,
-		)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al asignar puesto: " + err.Error()})
-			return
-		}
-
-		_, err = db.Exec(`
-			INSERT INTO salaries (emp_no, salary, from_date, to_date) 
-			VALUES (?, ?, CURDATE(), '9999-01-01')`,
-			nuevoID, datos.Salario,
-		)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al asignar salario: " + err.Error()})
-			return
-		}
-
-		c.JSON(http.StatusCreated, gin.H{
-			"mensaje":     "¡Empleado registrado con éxito en Coffeet! ☕",
-			"id_generado": nuevoID,
+			c.JSON(http.StatusOK, listaEmpleados)
 		})
-	})
 
-	// --- RUTA 3: ACTUALIZAR PUESTO Y SALARIO (UPDATE) ---
-	r.PUT("/empleados/:id", func(c *gin.Context) {
-		idEmpleado := c.Param("id")
-		var datos ActualizarEmpleado
+		// --- RUTA 2: REGISTRAR EMPLEADO (CREATE) ---
+		api.POST("/empleados", func(c *gin.Context) {
+			var datos NuevoEmpleado
 
-		if err := c.ShouldBindJSON(&datos); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Datos inválidos: " + err.Error()})
-			return
-		}
+			if err := c.ShouldBindJSON(&datos); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Datos inválidos: " + err.Error()})
+				return
+			}
 
-		_, err := db.Exec(`
-			UPDATE titles 
-			SET title = ? 
-			WHERE emp_no = ? AND to_date = '9999-01-01'`,
-			datos.Puesto, idEmpleado,
-		)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al actualizar el puesto: " + err.Error()})
-			return
-		}
+			var ultimoID int
+			err := db.QueryRow("SELECT MAX(emp_no) FROM employees").Scan(&ultimoID)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al calcular el nuevo ID: " + err.Error()})
+				return
+			}
+			nuevoID := ultimoID + 1
 
-		_, err = db.Exec(`
-			UPDATE salaries 
-			SET salary = ? 
-			WHERE emp_no = ? AND to_date = '9999-01-01'`,
-			datos.Salario, idEmpleado,
-		)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al actualizar el salario: " + err.Error()})
-			return
-		}
+			_, err = db.Exec(`
+				INSERT INTO employees (emp_no, birth_date, first_name, last_name, gender, hire_date) 
+				VALUES (?, '1995-01-01', ?, ?, 'M', CURDATE())`,
+				nuevoID, datos.FirstName, datos.LastName,
+			)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al crear empleado: " + err.Error()})
+				return
+			}
 
-		c.JSON(http.StatusOK, gin.H{
-			"mensaje": fmt.Sprintf("¡Datos del empleado %s actualizados con éxito! ☕", idEmpleado),
+			_, err = db.Exec(`
+				INSERT INTO titles (emp_no, title, from_date, to_date) 
+				VALUES (?, ?, CURDATE(), '9999-01-01')`,
+				nuevoID, datos.Puesto,
+			)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al asignar puesto: " + err.Error()})
+				return
+			}
+
+			_, err = db.Exec(`
+				INSERT INTO salaries (emp_no, salary, from_date, to_date) 
+				VALUES (?, ?, CURDATE(), '9999-01-01')`,
+				nuevoID, datos.Salario,
+			)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al asignar salario: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusCreated, gin.H{
+				"mensaje":     "¡Empleado registrado con éxito en Coffeet! ☕",
+				"id_generado": nuevoID,
+			})
 		})
-	})
 
-	// --- RUTA 4: BAJA DE PERSONAL (DELETE) ---
-	r.DELETE("/empleados/:id", func(c *gin.Context) {
-		idEmpleado := c.Param("id")
+		// --- RUTA 3: ACTUALIZAR PUESTO Y SALARIO (UPDATE) ---
+		api.PUT("/empleados/:id", func(c *gin.Context) {
+			idEmpleado := c.Param("id")
+			var datos ActualizarEmpleado
 
-		_, err := db.Exec("DELETE FROM salaries WHERE emp_no = ?", idEmpleado)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al borrar salarios: " + err.Error()})
-			return
-		}
+			if err := c.ShouldBindJSON(&datos); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Datos inválidos: " + err.Error()})
+				return
+			}
 
-		_, err = db.Exec("DELETE FROM titles WHERE emp_no = ?", idEmpleado)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al borrar puestos: " + err.Error()})
-			return
-		}
+			_, err := db.Exec(`
+				UPDATE titles 
+				SET title = ? 
+				WHERE emp_no = ? AND to_date = '9999-01-01'`,
+				datos.Puesto, idEmpleado,
+			)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al actualizar el puesto: " + err.Error()})
+				return
+			}
 
-		_, err = db.Exec("DELETE FROM employees WHERE emp_no = ?", idEmpleado)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al dar de baja al empleado: " + err.Error()})
-			return
-		}
+			_, err = db.Exec(`
+				UPDATE salaries 
+				SET salary = ? 
+				WHERE emp_no = ? AND to_date = '9999-01-01'`,
+				datos.Salario, idEmpleado,
+			)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al actualizar el salario: " + err.Error()})
+				return
+			}
 
-		c.JSON(http.StatusOK, gin.H{
-			"mensaje": fmt.Sprintf("¡Empleado %s dado de baja correctamente de Coffeet! ☕", idEmpleado),
+			c.JSON(http.StatusOK, gin.H{
+				"mensaje": fmt.Sprintf("¡Datos del empleado %s actualizados con éxito! ☕", idEmpleado),
+			})
 		})
-	})
+
+		// --- RUTA 4: BAJA DE PERSONAL (DELETE) ---
+		api.DELETE("/empleados/:id", func(c *gin.Context) {
+			idEmpleado := c.Param("id")
+
+			_, err := db.Exec("DELETE FROM salaries WHERE emp_no = ?", idEmpleado)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al borrar salarios: " + err.Error()})
+				return
+			}
+
+			_, err = db.Exec("DELETE FROM titles WHERE emp_no = ?", idEmpleado)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al borrar puestos: " + err.Error()})
+				return
+			}
+
+			_, err = db.Exec("DELETE FROM employees WHERE emp_no = ?", idEmpleado)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al dar de baja al empleado: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"mensaje": fmt.Sprintf("¡Empleado %s dado de baja correctamente de Coffeet! ☕", idEmpleado),
+			})
+		})
+	}
 
 	// --- CONFIGURACIÓN DINÁMICA DEL PUERTO PARA EL SERVIDOR (RENDER) ---
-	// Detecta el puerto que asigne la nube. Si no hay ninguno (local), usa el 8080.
 	puertoEnv := os.Getenv("PORT")
 	if puertoEnv == "" {
 		puertoEnv = "8080"
