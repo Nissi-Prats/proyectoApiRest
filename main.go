@@ -355,6 +355,104 @@ func main() {
 				"mensaje": "¡Usuario credencializado con éxito en Coffeet! ☕",
 			})
 		})
+
+		// =========================================================================
+		// --- NUEVOS ENDPOINTS: COMPLEMENTO DEL CRUD DE USUARIOS (SOLO ADMIN) ---
+		// =========================================================================
+
+		// --- RUTA 6: LISTAR TODOS LOS USUARIOS (READ) ---
+		api.GET("/usuarios", func(c *gin.Context) {
+			tokenHeader := c.GetHeader("Authorization")
+			var rolSolicitante string
+			err := db.QueryRow("SELECT rol FROM usuarios WHERE correo = ?", tokenHeader).Scan(&rolSolicitante)
+			if err != nil || rolSolicitante != "admin" {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Permisos insuficientes. Solo los administradores pueden ver los usuarios."})
+				return
+			}
+
+			rows, err := db.Query("SELECT correo, contrasena, rol, empleado_id FROM usuarios ORDER BY correo ASC")
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al consultar los usuarios: " + err.Error()})
+				return
+			}
+			defer rows.Close()
+
+			var listaUsuarios []RegistroUsuario
+
+			for rows.Next() {
+				var u RegistroUsuario
+				err := rows.Scan(&u.Correo, &u.Contrasena, &u.Rol, &u.EmpleadoID)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al leer datos de usuarios: " + err.Error()})
+					return
+				}
+				listaUsuarios = append(listaUsuarios, u)
+			}
+
+			c.JSON(http.StatusOK, listaUsuarios)
+		})
+
+		// --- RUTA 7: ACTUALIZAR CREDENCIALES/ROL DE UN USUARIO (UPDATE) ---
+		api.PUT("/usuarios", func(c *gin.Context) {
+			tokenHeader := c.GetHeader("Authorization")
+			var rolSolicitante string
+			err := db.QueryRow("SELECT rol FROM usuarios WHERE correo = ?", tokenHeader).Scan(&rolSolicitante)
+			if err != nil || rolSolicitante != "admin" {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Permisos insuficientes."})
+				return
+			}
+
+			var req RegistroUsuario
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Datos inválidos: " + err.Error()})
+				return
+			}
+
+			query := "UPDATE usuarios SET contrasena = ?, rol = ?, empleado_id = ? WHERE correo = ?"
+			_, err = db.Exec(query, req.Contrasena, req.Rol, req.EmpleadoID, req.Correo)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al actualizar el usuario: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"mensaje": "¡Usuario actualizado con éxito! ☕",
+			})
+		})
+
+		// --- RUTA 8: ELIMINAR ACCESO DE UN USUARIO (DELETE) ---
+		// Recibe el correo como Query Param (?correo=ejemplo@mail.com) debido a los caracteres del arroba y puntos
+		api.DELETE("/usuarios", func(c *gin.Context) {
+			tokenHeader := c.GetHeader("Authorization")
+			var rolSolicitante string
+			err := db.QueryRow("SELECT rol FROM usuarios WHERE correo = ?", tokenHeader).Scan(&rolSolicitante)
+			if err != nil || rolSolicitante != "admin" {
+				c.JSON(http.StatusForbidden, gin.H{"error": "Permisos insuficientes."})
+				return
+			}
+
+			correoAEliminar := c.Query("correo")
+			if correoAEliminar == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "El parámetro 'correo' es obligatorio."})
+				return
+			}
+
+			// Regla de seguridad: El administrador activo no puede borrarse a sí mismo desde la app
+			if tokenHeader == correoAEliminar {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "No puedes eliminar tu propio usuario en uso."})
+				return
+			}
+
+			_, err = db.Exec("DELETE FROM usuarios WHERE correo = ?", correoAEliminar)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Error al eliminar el acceso: " + err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusOK, gin.H{
+				"mensaje": "¡Usuario removido de la base de datos correctamente! ☕",
+			})
+		})
 	}
 
 	// --- CONFIGURACIÓN DINÁMICA DEL PUERTO PARA EL SERVIDOR (RENDER) ---
